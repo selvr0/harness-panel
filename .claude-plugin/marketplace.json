@@ -1,0 +1,5 @@
+{
+  "name": "harness-panel",
+  "owner": { "name": "selvr0" },
+  "plugins": [{ "name": "harness-panel", "source": "./" }]
+}

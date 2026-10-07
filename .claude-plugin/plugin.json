@@ -1,0 +1,23 @@
+{
+  "name": "harness-panel",
+  "version": "0.1.0",
+  "description": "Turn skills, hooks and plugins on or off per directory from a side panel",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Panel language (en, ko)",
+      "default": "en",
+      "options": [
+        "en",
+        "ko"
+      ]
+    }
+  },
+  "author": {
+    "name": "selvr0"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/selvr0/harness-panel"
+}
