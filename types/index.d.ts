@@ -17,12 +17,17 @@ export type TrashableSource =
 
 // 패널 한 줄(하네스 하나)
 export type HarnessItem = {
-  // 고유 id. 스킬은 "skill:<이름>", 훅은 "hook:<출처>:<이벤트>|<matcher>:<command>"
+  // 고유 id. 스킬은 "skill:<이름>" (하위 디렉토리 스킬은 "skill:dir:<세션 루트 기준 경로>:<이름>"), 훅은 "hook:<출처>:<이벤트>|<matcher>:<command>"
+  //   같은 command 를 여러 이벤트에 건 훅을 한 줄로 묶은 것은 "hook:<출처>:<command>"
   id: string
   // 패널에 보이는 이름
   label: string
   // 화면에는 언어팩의 kind.skill / kind.hook 으로 보임
   kind: 'skill' | 'hook'
+  // 이 줄을 끄고 켤 때 설정을 바꾸는 디렉토리 절대 경로
+  //   현재 디렉토리·전역·플러그인 줄: 세션 루트
+  //   하위 디렉토리 줄:               그 하위 디렉토리
+  settingsRoot: string
   isOn: boolean
   // 끄고 켤 때 무엇을 바꾸는지:
   //   skillOverrides: .claude/settings.local.json 의 skillOverrides
@@ -41,11 +46,22 @@ export type HarnessItem = {
   trashable?: TrashableSource
   // trashable 이 없을 때 그 이유. 예: "플러그인이 관리함"
   untrashableReason?: string
+  // 같은 command 를 여러 이벤트에 건 훅을 한 줄로 묶었으면, 묶인 훅 한 개 한 개 (이벤트마다 한 줄씩 만든 값)
+  //   예: iTerm2 의 cc-status 를 이벤트 10개에 건 경우 → 10개
+  //   켜고 끄기·휴지통은 이 훅들에 똑같이 적용함
+  members?: HarnessItem[]
 }
 
 // 패널 섹션 하나
 export type HarnessGroup = {
   id: string
+  // 패널에서 이 섹션이 속한 구역
+  //   directory: 세션 루트와 그 하위 디렉토리
+  //   global:    내 전역, claude.ai 계정
+  //   installed: 플러그인, Claude Code 기본 스킬
+  zone: 'directory' | 'global' | 'installed'
+  // 세션 루트 아래 하위 디렉토리 섹션이면 true. 패널에서 루트 아래로 한 단계 들여 씀
+  isNestedDirectory: boolean
   // 섹션 탭에 쓰는 짧은 이름
   tab: string
   title: string
@@ -66,9 +82,15 @@ export type TrashedHarness = {
   //   훅인데 스크립트를 남겨 뒀으면 둘 다 undefined
   originalPath?: string
   trashedPath?: string
-  // 훅이면 settings 에서 뺀 항목. 되돌리면 같은 자리에 다시 넣음
-  hook?: { settingsFile: string; event: string; matcher: string; entry: Record<string, unknown> }
+  // 훅이면 settings 에서 뺀 항목들. 되돌리면 같은 자리에 다시 넣음
+  //   묶인 줄이면 여러 개, 아니면 한 개
+  hooks?: TrashedHook[]
+  // 예전에 저장한 휴지통 값. 훅 한 개만 담겨 있음
+  hook?: TrashedHook
 }
+
+// 휴지통으로 옮기며 settings 에서 뺀 훅 한 개와 원래 자리
+export type TrashedHook = { settingsFile: string; event: string; matcher: string; entry: Record<string, unknown> }
 
 declare module 'claude-code' {
   interface PluginState {

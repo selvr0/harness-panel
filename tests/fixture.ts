@@ -1,5 +1,5 @@
 import { mock } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { ContextSkills, On } from 'claude-code'
 
 // 테스트용 운영체제 설정
 //   root: 세션을 연 디렉토리, home: 홈 디렉토리 (둘 다 "/" 로 씀. 윈도우는 플러그인이 받는 값만 "\" 로 바꿔 줌)
@@ -20,11 +20,20 @@ export function describeFixturePaths(platform: FixturePlatform) {
 //   options.settings:       .claude/settings.json 내용을 바꿀 때
 //   options.hookResults:    훅 command → 그 훅을 돌렸을 때의 결과 (없으면 종료 코드 0)
 //   options.store:          패널 저장소에 미리 넣어 둘 값
+//   options.readSkillListing: session.usage 가 줄 스킬 목록을 부를 때마다 돌려줌 (없으면 review 하나)
 export type FixtureOptions = {
   linuxTrashTool?: boolean
   settings?: Record<string, unknown>
   hookResults?: Record<string, { exitCode: number; stdout?: string; stderr?: string }>
   store?: Record<string, unknown>
+  readSkillListing?: () => ContextSkills | undefined
+}
+
+const ONLY_REVIEW_LISTED: ContextSkills = {
+  totalSkills: 1,
+  includedSkills: 1,
+  tokens: 10,
+  skillFrontmatter: [{ name: 'review', source: 'projectSettings', tokens: 10 }],
 }
 
 export function setUpEngine(on: On, platform: FixturePlatform = 'mac', options: FixtureOptions = {}) {
@@ -56,7 +65,14 @@ export function setUpEngine(on: On, platform: FixturePlatform = 'mac', options: 
     on,
     platform === 'windows' ? { OS: 'Windows_NT', USERPROFILE: home.replace(/\//g, '\\') } : { HOME: home },
   )
-  mock.store(on, options.store ?? {})
+  // 패널 저장소. mock.store 는 안의 값을 테스트에서 볼 수 없어서 직접 둠. key → value
+  const savedStore = new Map<string, unknown>(Object.entries(options.store ?? {}))
+  on('store.get', (_$, e) => ({ value: savedStore.get((e as { key: string }).key) }) as never)
+  on('store.set', (_$, e) => {
+    const { key, value } = e as { key: string; value: unknown }
+    savedStore.set(key, value)
+    return { value: undefined } as never
+  })
   on('session.id', () => ({ value: 'test-session' }) as never)
   mock.clock(on)
   const existsCalls: string[] = []
@@ -70,7 +86,8 @@ export function setUpEngine(on: On, platform: FixturePlatform = 'mac', options: 
     const dir = toFixturePath((e as { path: string }).path)
     const names = new Set<string>()
     for (const k of files.keys()) if (k.startsWith(`${dir}/`)) names.add(k.slice(dir.length + 1).split('/')[0]!)
-    return { value: [...names].map(name => ({ name, kind: 'file', size: 0, mtimeMs: 0 })) } as never
+    const kindOf = (name: string) => ([...files.keys()].some(k => k.startsWith(`${dir}/${name}/`)) ? 'dir' : 'file')
+    return { value: [...names].map(name => ({ name, kind: kindOf(name), size: 0, mtimeMs: 0 })) } as never
   })
   on('fs.write', (_$, e) => {
     const { path, text } = e as { path: string; text: string }
@@ -129,23 +146,22 @@ export function setUpEngine(on: On, platform: FixturePlatform = 'mac', options: 
     return ok()
   })
   on('settings.read', () => ({ value: {} }))
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  // $.ui.open 으로 연 패널 id 를 순서대로 모음
+  const openedPanes: string[] = []
+  on('ui.open', (_$, e) => {
+    openedPanes.push((e as { id: string }).id)
+    return { value: { isPlaced: true } }
+  })
   on('session.usage', () => ({
     value: {
       startedAt: 0,
       rateLimits: [],
       context: {
-        breakdown: {
-          skills: {
-            totalSkills: 1,
-            includedSkills: 1,
-            skillFrontmatter: [{ name: 'review', source: 'projectSettings', tokens: 10 }],
-          },
-        },
+        breakdown: { skills: options.readSkillListing ? options.readSkillListing() : ONLY_REVIEW_LISTED },
       },
     },
   }) as never)
-  return { files, commands, home, root, settings, existsCalls }
+  return { files, commands, home, root, settings, existsCalls, savedStore, openedPanes }
 }
 
 export async function mountHarnessPane($: any) {

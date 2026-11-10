@@ -46,7 +46,7 @@ Open the panel once:
 /harness
 ```
 
-From the next session on, it opens by itself.
+From the next session on, it opens by itself. To stop that, press `[ Auto-open: on ]` in the panel.
 
 **To dock it on the right**, Claude Code needs its fullscreen layout. Without it, the panel shows above the prompt instead.
 
@@ -72,13 +72,14 @@ From the next session on, it opens by itself.
 | Close the panel | `[ Close ]` at the top right |
 | Open it again | `/harness` |
 
-Every change applies to **the current directory only**. Each directory keeps its own on/off state.
+Changes to root and global items apply to **the current directory only**. Changes in a subdirectory section apply to **sessions opened in that subdirectory**; the current session does not change.
 
 ### Sections
 
 | Section | What is in it |
 |---|---|
-| This directory | Skills and hooks in `.claude/` of the directory you opened Claude Code in |
+| Root (the actual folder name) | Skills and hooks in `.claude/` of the directory you opened Claude Code in |
+| One per subdirectory | Skills and hooks in that subdirectory's `.claude/`. Hidden folders and `node_modules`, `dist`, `build`, `target`, `vendor` are not searched |
 | Global | Skills and hooks in `~/.claude/` |
 | claude.ai | Skills turned on in your claude.ai account |
 | One section per plugin | That plugin's skills and hooks. The button next to the title turns the whole plugin on or off |
@@ -118,6 +119,8 @@ Run `/reload-plugins` afterwards, or start a new session.
 | A whole plugin | `enabledPlugins` in `.claude/settings.local.json` | After `/reload-plugins` |
 
 Hooks are turned off one at a time. When a hook on an event is off, the panel runs the remaining hooks on that event itself, the same way Claude Code would. Only `command` hooks are run this way; other hook types on that event are skipped while any hook there is off.
+
+A command hooked to several events (for example iTerm2's `cc-status`, which is set on 10 events) shows as one row. Turning that row off, or moving it to the trash, applies to every event it is set on.
 
 ## 6. Platforms
 

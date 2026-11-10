@@ -4,6 +4,7 @@ export type Language = 'en' | 'ko'
 
 export type Messages = {
   panelTitle: string
+  autoOpen: (isOn: boolean) => string
   close: string
   summary: (total: number, on: number) => string
   location: string
@@ -18,8 +19,10 @@ export type Messages = {
   kind: { skill: string; hook: string }
   // 켜고 끄는 버튼. 세 글자로 맞춰서 버튼 폭이 흔들리지 않게 함
   switch: { on: string; off: string; mixed: string }
+  // 패널 구역 제목
+  zones: { directory: string; global: string; installed: string }
   groups: {
-    proj: { tab: string; title: string; where: string }
+    proj: { tab: string; where: string }
     user: { tab: string; title: string; where: string }
     synced: { tab: string; title: string; where: string }
     builtin: { tab: string; title: string; where: string }
@@ -53,6 +56,7 @@ export type Messages = {
 
 const en: Messages = {
   panelTitle: 'Harness Panel',
+  autoOpen: isOn => `Auto-open: ${isOn ? 'on' : 'off'}`,
   close: 'Close',
   summary: (total, on) => `${on} of ${total} on`,
   location: 'Location',
@@ -66,8 +70,9 @@ const en: Messages = {
   restore: 'Restore',
   kind: { skill: 'skill', hook: 'hook' },
   switch: { on: ' ON', off: 'OFF', mixed: 'MIX' },
+  zones: { directory: 'Directories', global: 'Global', installed: 'Plugins · Built-in' },
   groups: {
-    proj: { tab: 'Here', title: 'This directory', where: '.claude' },
+    proj: { tab: 'Root', where: 'root' },
     user: { tab: 'Global', title: 'Global', where: '~/.claude' },
     synced: { tab: 'claude.ai', title: 'anthropic-skills', where: 'claude.ai account' },
     builtin: { tab: 'Built-in', title: 'Built-in skills', where: 'Claude Code' },
@@ -115,6 +120,7 @@ const en: Messages = {
 
 const ko: Messages = {
   panelTitle: '하네스 패널',
+  autoOpen: isOn => `자동 열기: ${isOn ? '켜짐' : '꺼짐'}`,
   close: '닫기',
   summary: (total, on) => `전체 ${total}개 중 ${on}개 켜짐`,
   location: '위치',
@@ -128,8 +134,9 @@ const ko: Messages = {
   restore: '되돌리기',
   kind: { skill: '스킬', hook: '훅' },
   switch: { on: ' ON', off: 'OFF', mixed: '일부' },
+  zones: { directory: '디렉토리', global: '전역', installed: '플러그인 · 기본' },
   groups: {
-    proj: { tab: '현재', title: '현재 디렉토리', where: '.claude' },
+    proj: { tab: '루트', where: '루트' },
     user: { tab: '전역', title: '내 전역', where: '~/.claude' },
     synced: { tab: 'claude.ai', title: 'anthropic-skills', where: 'claude.ai 계정' },
     builtin: { tab: '기본', title: '기본 스킬', where: 'Claude Code' },

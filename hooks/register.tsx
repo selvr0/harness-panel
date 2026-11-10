@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { ContextSkills, EngineInterface, Register } from 'claude-code'
 
-import type { HarnessGroup, HarnessItem, TrashedHarness } from '../types'
+import type { HarnessGroup, HarnessItem, TrashableSource, TrashedHarness, TrashedHook } from '../types'
 import {
   type HookSettings,
   insertHookIntoSettings,
@@ -118,6 +118,7 @@ async function writeModOffList($: Engine, root: string, list: ModOffList) {
 }
 
 // 한 번 본 스킬 목록. 꺼진 스킬은 Claude Code 목록에서 사라지므로, 패널에 계속 보이게 기억해 둠
+// 꺼 둔 적 없는데 목록에서 사라진 스킬은 지워진 것으로 보고 여기서도 뺌
 // key:   "seen-skills:<세션 루트>"
 // value: [{ name: <스킬 이름>, source: <Claude Code 가 주는 출처>, pluginName?: <플러그인 이름> }]
 type SeenSkill = { name: string; source: string; pluginName?: string }
@@ -127,10 +128,15 @@ async function forgetSeenSkill($: Engine, root: string, name: string) {
   await $.store.set(`seen-skills:${root}`, seen.filter(s => s.name !== name))
 }
 
-const CORE_GROUP_IDS = ['proj', 'user', 'synced'] as const
+const CORE_GROUP_IDS = ['user', 'synced'] as const
 
-function describeCoreGroup(id: 'proj' | 'user' | 'synced' | 'builtin'): Omit<HarnessGroup, 'items'> {
-  return { id, ...text.groups[id] }
+// 세션을 연 디렉토리의 섹션. 제목은 실제 폴더 이름. 예: "my-project"
+function describeRootGroup(root: string): Omit<HarnessGroup, 'items'> {
+  return { id: 'proj', zone: 'directory', isNestedDirectory: false, title: basename(root), ...text.groups.proj }
+}
+
+function describeCoreGroup(id: 'user' | 'synced' | 'builtin'): Omit<HarnessGroup, 'items'> {
+  return { id, zone: id === 'builtin' ? 'installed' : 'global', isNestedDirectory: false, ...text.groups[id] }
 }
 
 // 경로를 패널에 보이게 줄임
@@ -142,11 +148,75 @@ function shortenPath(path: string, root: string, home: string) {
   return path
 }
 
-async function collectListedSkills($: Engine, root: string): Promise<SeenSkill[]> {
+// 목록에 없는 스킬을 어떻게 할지
+//   forget-missing: 꺼 둔 것만 남기고 뺌. 세션 시작·턴 끝·/harness 처럼 Claude Code 목록이 지금 상태일 때 씀
+//   keep-missing:   모두 남김. 버튼을 누른 직후에 씀. 이때 Claude Code 목록은 아직 옛 상태라서,
+//                   방금 켠 스킬이 목록에 없다고 지우면 그 줄이 패널에서 사라짐
+type MissingSkillPolicy = 'forget-missing' | 'keep-missing'
+
+// 목록에 없는 스킬이 꺼 둔 것인지 가릴 때 보는 값
+//   skillOverrides:       settings 3개를 합친 skillOverrides
+//   offPluginSkills:      패널에서 하나씩 꺼 둔 플러그인 스킬 이름
+//   installedPluginNames: 이 폴더에 설치된 플러그인 이름
+type SkillOffSources = {
+  skillOverrides: Record<string, string>
+  offPluginSkills: string[]
+  installedPluginNames: string[]
+}
+
+// Claude Code 목록에서 빠지는 skillOverrides 값. name-only 는 설명만 빠지고 목록에는 남음
+const OVERRIDES_HIDING_FROM_LISTING = ['off', 'user-invocable-only']
+
+// 같은 스킬을 가리키는 이름인지 봄. 한쪽에만 접두어가 있으면 그 접두어를 빼고 견줌
+//   "dgkit:x", "x"       → 같음
+//   "dgkit:x", "other:x" → 다름
+function isSameSkillName(a: string, b: string) {
+  return a === b || a.endsWith(`:${b}`) || b.endsWith(`:${a}`)
+}
+
+// 목록에 없는 스킬이 꺼 둔 것이면 true
+//   1. 패널에서 그 스킬만 끔
+//   2. skillOverrides 로 끔
+//   3. 플러그인이 설치돼 있는데 그 플러그인 스킬이 목록에 하나도 없음
+//      꺼 둔 플러그인이거나, 패널에서 막 켜서 /reload-plugins 를 기다리는 플러그인임
+//      다시 켜면 목록에 돌아오므로, 그때 없는 스킬만 지워진 것으로 봄
+function isUnlistedSkillTurnedOff(skill: SeenSkill, offSources: SkillOffSources, listedPluginNames: Set<string>) {
+  const { skillOverrides, offPluginSkills, installedPluginNames } = offSources
+  if (offPluginSkills.some(off => isSameSkillName(off, skill.name))) return true
+  const isHiddenByOverride = Object.entries(skillOverrides).some(
+    ([name, value]) => OVERRIDES_HIDING_FROM_LISTING.includes(value) && isSameSkillName(name, skill.name),
+  )
+  if (isHiddenByOverride) return true
+  if (!skill.pluginName) return false
+  return installedPluginNames.includes(skill.pluginName) && !listedPluginNames.has(skill.pluginName)
+}
+
+// 목록이 이 세션의 스킬을 빠짐없이 담았는지 봄. 아래일 때는 없는 스킬이 지워진 것인지 알 수 없음
+//   skills 가 없음:          세션이 아직 안 묶였거나 Claude Code 가 skills 를 안 줌
+//   skillFrontmatter 가 빔:  Skill 도구가 없는 세션이거나 Claude Code 가 목록을 읽다 실패함
+//   included < total:        허용 목록(allowlist)이 있는 세션처럼 일부만 담김
+function isSkillListingComplete(skills: ContextSkills | undefined): skills is ContextSkills {
+  return !!skills && skills.skillFrontmatter.length > 0 && skills.includedSkills >= skills.totalSkills
+}
+
+// 저장된 목록을 지금 Claude Code 목록에 맞춤. 목록에 있는 것은 넣고, 없는 것은 policy 에 따라 남기거나 뺌
+async function syncSeenSkillsWithListing(
+  $: Engine,
+  root: string,
+  offSources: SkillOffSources,
+  policy: MissingSkillPolicy,
+): Promise<SeenSkill[]> {
   const usage = await $.session.usage({ breakdown: 'summary' })
-  const listed = usage.context.breakdown?.skills?.skillFrontmatter ?? []
+  const skills = usage.context.breakdown?.skills
+  const listed = skills?.skillFrontmatter ?? []
   const seen = ((await $.store.get(`seen-skills:${root}`)) as SeenSkill[] | undefined) ?? []
-  const byName = new Map<string, SeenSkill>(seen.map(s => [s.name, s]))
+  const listedNames = new Set(listed.map(s => s.name))
+  const listedPluginNames = new Set(listed.flatMap(s => (s.pluginName ? [s.pluginName] : [])))
+  const mayForget = policy === 'forget-missing' && isSkillListingComplete(skills)
+  const kept = mayForget
+    ? seen.filter(s => listedNames.has(s.name) || isUnlistedSkillTurnedOff(s, offSources, listedPluginNames))
+    : seen
+  const byName = new Map<string, SeenSkill>(kept.map(s => [s.name, s]))
   for (const s of listed) byName.set(s.name, { name: s.name, source: s.source, pluginName: s.pluginName })
   const merged = [...byName.values()]
   await $.store.set(`seen-skills:${root}`, merged)
@@ -202,9 +272,16 @@ function resolveHookScriptPath(command: string, root: string, home: string, plug
   return path
 }
 
+// 훅 줄에 보일 이름
+//   스크립트 파일이 있으면 그 파일 이름. 예: "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/check.py\"" → "check.py"
+//   확장자 없는 실행 파일을 경로로 부르면 그 파일 이름. 예: "/Users/me/.config/iterm2/cc-status" → "cc-status"
+//   둘 다 아니면 명령 앞부분
 function describeHookCommand(command: string) {
   const script = command.match(/([\w.-]+\.(?:py|sh|mjs|cjs|js|ts))/)
-  return script?.[1] ?? command.slice(0, 32)
+  if (script?.[1]) return script[1]
+  const program = command.trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, '') ?? ''
+  if (program.includes('/')) return program.split('/').pop() || command.slice(0, 32)
+  return command.slice(0, 32)
 }
 
 function describeHookEvent(event: string, matcher: string) {
@@ -230,7 +307,7 @@ function buildHookItems(
   home: string,
   legacyPairs: [string, string][],
 ): HarnessItem[] {
-  const items: HarnessItem[] = []
+  const items: { command: string; item: HarnessItem }[] = []
   for (const [event, entries] of Object.entries(source.hooks ?? {})) {
     for (const entry of entries ?? []) {
       const matcher = entry.matcher ?? ''
@@ -239,11 +316,12 @@ function buildHookItems(
         const target = hookTarget(event, matcher, command)
         legacyPairs.push([`${event}|${matcher}`, target])
         const scriptPath = resolveHookScriptPath(command, root, home, source.pluginRoot)
-        items.push({
+        const item: HarnessItem = {
           id: `hook:${source.name}:${event}|${matcher}:${command}`,
           label: describeHookCommand(command),
           detail: describeHookEvent(event, matcher),
           kind: 'hook',
+          settingsRoot: root,
           isOn: !offHooks.includes(target) && !offHooks.includes(`${event}|${matcher}`),
           control: 'hook',
           target,
@@ -253,11 +331,33 @@ function buildHookItems(
             ? { kind: 'hook', settingsFile: source.settingsFile, event, matcher, command, scriptPath }
             : undefined,
           untrashableReason: source.settingsFile ? undefined : text.untrashable.pluginHook,
-        })
+        }
+        items.push({ command, item })
       }
     }
   }
-  return items
+  return groupHooksByCommand(items, source.name)
+}
+
+// 같은 command 를 여러 이벤트에 건 훅은 한 줄로 묶음
+//   예: iTerm2 가 cc-status 를 이벤트 10개에 걸면 패널에 같은 이름이 10줄 나옴 → "cc-status" 한 줄
+//   묶은 줄의 실행 시점은 이벤트들을 이어 붙임. 하나라도 꺼져 있으면 OFF 로 보임
+//   command 가 하나뿐인 훅은 그대로 둠
+function groupHooksByCommand(items: { command: string; item: HarnessItem }[], sourceName: string): HarnessItem[] {
+  // key: command, value: 그 command 를 쓰는 훅 줄들 (settings 에 적힌 순서)
+  const byCommand = new Map<string, HarnessItem[]>()
+  for (const { command, item } of items) byCommand.set(command, [...(byCommand.get(command) ?? []), item])
+  return [...byCommand].map(([command, members]) => {
+    if (members.length === 1) return members[0]!
+    const first = members[0]!
+    return {
+      ...first,
+      id: `hook:${sourceName}:${command}`,
+      detail: members.map(m => m.detail).join(' · '),
+      isOn: members.every(m => m.isOn),
+      members,
+    }
+  })
 }
 
 // 같은 스크립트를 훅 두 개 이상이 쓰면, 하나를 휴지통으로 옮길 때 스크립트는 남겨 둠
@@ -297,7 +397,21 @@ async function migrateLegacyHookOffKeys($: Engine, root: string, off: ModOffList
   await writeModOffList($, root, { ...off, hooks: [...hooks] })
 }
 
-async function collectHarnessGroups($: Engine, root: string, home: string): Promise<HarnessGroup[]> {
+// 스킬을 위에, 훅을 아래에 두고, 같은 종류 안에서는 이름순
+//   이름 앞에 분류를 붙여 두면(github-·test- 등) 같은 분류끼리 모여 보임
+function sortHarnessItems(groups: HarnessGroup[]) {
+  for (const g of groups) {
+    g.items.sort((a, b) => (a.kind === b.kind ? a.label.localeCompare(b.label) : a.kind === 'skill' ? -1 : 1))
+  }
+}
+
+async function collectHarnessGroups(
+  $: Engine,
+  root: string,
+  home: string,
+  missingSkillPolicy: MissingSkillPolicy,
+  nestedRoots: string[],
+): Promise<HarnessGroup[]> {
   // $.settings.read() 는 파일을 고친 직후엔 옛 값을 줄 수 있음. 토글 직후 화면이 되돌아가지 않게 파일을 직접 읽음
   const userFile = (await readJsonFile($, userSettingsPath(home))) ?? {}
   const projectFile = (await readJsonFile($, projectSettingsPath(root))) ?? {}
@@ -316,12 +430,15 @@ async function collectHarnessGroups($: Engine, root: string, home: string): Prom
   const off = await readModOffList($, root)
 
   const groups = new Map<string, HarnessGroup>()
+  groups.set('proj', { ...describeRootGroup(root), items: [] })
   for (const id of CORE_GROUP_IDS) groups.set(id, { ...describeCoreGroup(id), items: [] })
 
   const plugins = await collectInstalledPlugins($, home, root)
   for (const p of plugins) {
     groups.set(`plugin:${p.name}`, {
       id: `plugin:${p.name}`,
+      zone: 'installed',
+      isNestedDirectory: false,
       tab: p.name.replace(/-lsp$/, ''),
       title: p.name,
       where: text.groups.pluginWhere,
@@ -355,11 +472,16 @@ async function collectHarnessGroups($: Engine, root: string, home: string): Prom
 
   // 스킬
   const syncedBases = await listSyncedSkillBases($, home)
-  for (const skill of await collectListedSkills($, root)) {
+  const offSources: SkillOffSources = {
+    skillOverrides,
+    offPluginSkills: off.pluginSkills,
+    installedPluginNames: plugins.map(p => p.name),
+  }
+  for (const skill of await syncSeenSkillsWithListing($, root, offSources, missingSkillPolicy)) {
     const groupId = resolveSkillGroupId(skill)
     // 설치 목록에 없는 플러그인(--plugin-dir 로 띄운 것)도 플러그인 섹션을 따로 만듦
     if (skill.pluginName && !groups.has(groupId)) {
-      groups.set(groupId, { id: groupId, tab: skill.pluginName, title: skill.pluginName, where: text.groups.pluginWhere, items: [] })
+      groups.set(groupId, { id: groupId, zone: 'installed', isNestedDirectory: false, tab: skill.pluginName, title: skill.pluginName, where: text.groups.pluginWhere, items: [] })
     }
     const group = groups.get(groupId) ?? groups.get('builtin')!
     const plugin = plugins.find(p => p.name === skill.pluginName)
@@ -381,6 +503,7 @@ async function collectHarnessGroups($: Engine, root: string, home: string): Prom
       id: `skill:${skill.name}`,
       label: shortName,
       kind: 'skill',
+      settingsRoot: root,
       isOn: isPluginSkill ? !off.pluginSkills.includes(skill.name) : skillOverrides[skill.name] !== 'off',
       control: isPluginSkill ? 'pluginSkill' : 'skillOverrides',
       target: skill.name,
@@ -406,6 +529,7 @@ async function collectHarnessGroups($: Engine, root: string, home: string): Prom
         id: `skill:${name}`,
         label: name,
         kind: 'skill',
+        settingsRoot: root,
         isOn: false,
         control: 'skillOverrides',
         target: name,
@@ -417,10 +541,123 @@ async function collectHarnessGroups($: Engine, root: string, home: string): Prom
     }
   }
 
-  for (const g of groups.values()) {
-    g.items.sort((a, b) => (a.kind === b.kind ? 0 : a.kind === 'skill' ? -1 : 1))
+  sortHarnessItems([...groups.values()])
+  const nestedGroups = await collectNestedDirectoryGroups($, nestedRoots, root, home, userFile.skillOverrides ?? {})
+  // 하위 디렉토리 섹션은 현재 디렉토리 섹션 바로 아래에 둠
+  const [rootGroup, ...otherGroups] = [...groups.values()]
+  const visibleNestedGroups = nestedGroups.filter(g => g.items.length > 0)
+  // 하위 디렉토리가 있으면 루트 자체에 스킬·훅이 없어도 루트 섹션을 남겨 상하 관계를 보여줌
+  const visibleRootGroups = rootGroup!.items.length > 0 || visibleNestedGroups.length > 0 ? [rootGroup!] : []
+  return [...visibleRootGroups, ...visibleNestedGroups, ...otherGroups.filter(g => g.items.length > 0 || g.pluginId)]
+}
+
+// ── 하위 디렉토리의 스킬·훅 ─────────────────────────
+
+// 찾지 않는 폴더 이름. 이름이 "." 으로 시작하는 폴더(.git, .erp-monorepo.git 등)도 찾지 않음
+const SKIPPED_DIRECTORY_NAMES = new Set(['node_modules', 'dist', 'build', 'target', 'vendor'])
+
+// 홈 디렉토리처럼 아주 큰 폴더에서 세션을 열어도 패널이 멈추지 않게 읽는 폴더 수를 제한함
+const MAX_SCANNED_DIRECTORIES = 50_000
+const SCAN_BATCH_SIZE = 64
+
+// 세션 루트 아래에서 .claude 폴더를 가진 디렉토리를 모두 찾음. 세션 루트 자신은 뺌
+// 반환값: 디렉토리 절대 경로 목록. 예: ["/repo/apps/web", "/repo/apps/api"]
+async function discoverNestedClaudeRoots($: Engine, root: string): Promise<string[]> {
+  const found: string[] = []
+  let current = [root]
+  let scanned = 0
+  while (current.length > 0 && scanned < MAX_SCANNED_DIRECTORIES) {
+    const batch = current.slice(0, SCAN_BATCH_SIZE)
+    current = current.slice(SCAN_BATCH_SIZE)
+    scanned += batch.length
+    const listings = await Promise.all(batch.map(dir => $.fs.list(dir).catch(() => [])))
+    listings.forEach((entries, index) => {
+      const dir = batch[index]!
+      if (dir !== root && entries.some(e => e.name === '.claude' && e.kind === 'dir')) found.push(dir)
+      for (const e of entries) {
+        if (e.kind === 'dir' && !e.name.startsWith('.') && !SKIPPED_DIRECTORY_NAMES.has(e.name)) current.push(`${dir}/${e.name}`)
+      }
+    })
   }
-  return [...groups.values()].filter(g => g.items.length > 0 || g.pluginId)
+  return found.sort((a, b) => a.localeCompare(b))
+}
+
+// <디렉토리>/.claude/skills/<이름>/SKILL.md 가 있는 스킬을 패널 줄로 만듦
+// 꺼진 스킬도 파일은 있으므로 여기서 함께 나옴
+async function buildNestedSkillItems(
+  $: Engine,
+  dirRoot: string,
+  groupId: string,
+  skillOverrides: Record<string, string>,
+  home: string,
+): Promise<HarnessItem[]> {
+  const skillsDir = `${dirRoot}/.claude/skills`
+  const entries = (await $.fs.exists(skillsDir)) ? await $.fs.list(skillsDir) : []
+  const items: HarnessItem[] = []
+  for (const entry of entries) {
+    const found = await findSkillFile($, [`${dirRoot}/.claude`], entry.name)
+    if (!found) continue
+    items.push({
+      id: `skill:${groupId}:${entry.name}`,
+      label: entry.name,
+      kind: 'skill',
+      settingsRoot: dirRoot,
+      isOn: skillOverrides[entry.name] !== 'off',
+      control: 'skillOverrides',
+      target: entry.name,
+      filePath: found.filePath,
+      displayPath: shortenPath(found.filePath, dirRoot, home),
+      trashable: { kind: 'skill', path: found.trashPath },
+    })
+  }
+  return items
+}
+
+// 하위 디렉토리 하나를 패널 섹션 하나로 만듦
+//   제목:     디렉토리 이름. 예: "erp-epsilon"
+//   제목 옆:  세션 루트 기준 부모 경로. 예: "제품/GOS/워크스페이스"
+// 스킬·훅이 하나도 없는 디렉토리의 섹션은 collectHarnessGroups 가 뺌
+async function buildNestedDirectoryGroup(
+  $: Engine,
+  dirRoot: string,
+  root: string,
+  home: string,
+  userSkillOverrides: Record<string, string>,
+): Promise<HarnessGroup> {
+  const relativePath = dirRoot.slice(root.length + 1)
+  const groupId = `dir:${relativePath}`
+  const projectFile = (await readJsonFile($, projectSettingsPath(dirRoot))) ?? {}
+  const localFile = (await readJsonFile($, localSettingsPath(dirRoot))) ?? {}
+  const off = await readModOffList($, dirRoot)
+  const skillItems = await buildNestedSkillItems(
+    $,
+    dirRoot,
+    groupId,
+    { ...userSkillOverrides, ...localFile.skillOverrides, ...projectFile.skillOverrides },
+    home,
+  )
+  const legacyPairs: [string, string][] = []
+  const hookItems = [
+    { name: `${groupId}:project`, hooks: projectFile.hooks as HookSettings | undefined, settingsFile: projectSettingsPath(dirRoot) },
+    { name: `${groupId}:local`, hooks: localFile.hooks as HookSettings | undefined, settingsFile: localSettingsPath(dirRoot) },
+  ].flatMap(source => buildHookItems(source, off.hooks, dirRoot, home, legacyPairs))
+  keepSharedHookScripts(hookItems)
+  await migrateLegacyHookOffKeys($, dirRoot, off, legacyPairs)
+  const relativeParent = relativePath.includes('/') ? dirname(relativePath) : '.'
+  return { id: groupId, zone: 'directory', isNestedDirectory: true, tab: basename(dirRoot), title: basename(dirRoot), where: relativeParent, items: [...skillItems, ...hookItems] }
+}
+
+async function collectNestedDirectoryGroups(
+  $: Engine,
+  nestedRoots: string[],
+  root: string,
+  home: string,
+  userSkillOverrides: Record<string, string>,
+): Promise<HarnessGroup[]> {
+  const groups: HarnessGroup[] = []
+  for (const dirRoot of nestedRoots) groups.push(await buildNestedDirectoryGroup($, dirRoot, root, home, userSkillOverrides))
+  sortHarnessItems(groups)
+  return groups
 }
 
 // ── 에디터로 열기·휴지통 ───────────────────────────
@@ -505,24 +742,30 @@ async function moveHarnessToTrash($: Engine, item: HarnessItem, home: string): P
     return { id: item.id, label: item.label, kind: item.kind, originalPath: source.path, trashedPath }
   }
 
-  let removed: Record<string, unknown> | undefined
+  // 묶인 줄이면 묶인 훅을 모두 settings 에서 뺌. 묶인 훅은 출처가 같아서 settings 파일도 하나임
+  const places = (item.members ?? [item])
+    .map(m => m.trashable)
+    .filter((t): t is Extract<TrashableSource, { kind: 'hook' }> => t?.kind === 'hook')
+  const hooks: TrashedHook[] = []
   await editSettingsFile($, source.settingsFile, settings => {
-    removed = removeHookFromSettings(settings, source.event, source.matcher, source.command)
+    for (const place of places) {
+      const removed = removeHookFromSettings(settings, place.event, place.matcher, place.command)
+      if (removed) hooks.push({ settingsFile: place.settingsFile, event: place.event, matcher: place.matcher, entry: removed })
+    }
   })
-  if (!removed) throw new Error(text.error.hookNotFound)
-  const hook = { settingsFile: source.settingsFile, event: source.event, matcher: source.matcher, entry: removed }
+  if (hooks.length === 0) throw new Error(text.error.hookNotFound)
 
   if (!source.scriptPath || !(await $.fs.exists(source.scriptPath))) {
-    return { id: item.id, label: item.label, kind: item.kind, hook }
+    return { id: item.id, label: item.label, kind: item.kind, hooks }
   }
   const trashedPath = await moveToSystemTrash($, source.scriptPath, home)
-  return { id: item.id, label: item.label, kind: item.kind, originalPath: source.scriptPath, trashedPath, hook }
+  return { id: item.id, label: item.label, kind: item.kind, originalPath: source.scriptPath, trashedPath, hooks }
 }
 
 async function restoreHarnessFromTrash($: Engine, trashed: TrashedHarness, home: string) {
   if (trashed.originalPath) await moveBackFromTrash($, trashed.originalPath, trashed.trashedPath, home)
-  const hook = trashed.hook
-  if (hook) {
+  const hooks = trashed.hooks ?? (trashed.hook ? [trashed.hook] : [])
+  for (const hook of hooks) {
     await editSettingsFile($, hook.settingsFile, settings => {
       insertHookIntoSettings(settings, hook.event, hook.matcher, hook.entry)
     })
@@ -540,6 +783,9 @@ const openGroupsAtom = atom(
 const selectedItemAtom = atom({ plugin: 'harness-panel', key: 'selectedItem' } as const, null as string | null)
 const confirmingTrashAtom = atom({ plugin: 'harness-panel', key: 'confirmingTrash' } as const, null as string | null)
 const trashAtom = atom({ plugin: 'harness-panel', key: 'trash' } as const, [] as TrashedHarness[])
+// .claude 폴더를 가진 하위 디렉토리 절대 경로 목록
+// 폴더를 모두 읽는 일이라서 세션 시작과 /harness 때만 다시 찾음. 턴 끝·버튼 누른 뒤에는 이 목록을 그대로 씀
+const nestedRootsAtom = atom({ plugin: 'harness-panel', key: 'nestedRoots' } as const, [] as string[])
 
 // 경로는 모두 "/" 로 맞춤. 홈은 맥·리눅스 HOME, 윈도우 USERPROFILE
 async function readSessionPaths($: Engine) {
@@ -565,9 +811,18 @@ async function writeTrashList($: Engine, root: string, list: TrashedHarness[]) {
   await update($, trashAtom, () => list)
 }
 
-async function refreshHarnessPanel($: Engine) {
+// 하위 디렉토리를 다시 찾은 뒤 패널을 새로 그림
+async function rediscoverDirectoriesAndRefreshPanel($: Engine) {
+  const { root } = await readSessionPaths($)
+  const nestedRoots = await discoverNestedClaudeRoots($, root)
+  await update($, nestedRootsAtom, () => nestedRoots)
+  await refreshHarnessPanel($, 'forget-missing')
+}
+
+async function refreshHarnessPanel($: Engine, missingSkillPolicy: MissingSkillPolicy) {
   const { root, home } = await readSessionPaths($)
-  const groups = await collectHarnessGroups($, root, home)
+  const nestedRoots = await read($, nestedRootsAtom)
+  const groups = await collectHarnessGroups($, root, home, missingSkillPolicy, nestedRoots)
   await update($, groupsAtom, () => groups)
   const trash = await readTrashList($, root)
   await update($, trashAtom, () => trash)
@@ -586,23 +841,27 @@ async function setHarnessItemsOn($: Engine, items: HarnessItem[], isOn: boolean)
   await showChangeImmediately($, groups =>
     groups.map(g => ({ ...g, items: g.items.map(i => (ids.has(i.id) ? { ...i, isOn } : i)) })),
   )
-  const { root } = await readSessionPaths($)
-  const overrides = items.filter(i => i.control === 'skillOverrides')
-  if (overrides.length > 0) {
-    await editSettingsFile($, localSettingsPath(root), settings => {
-      for (const i of overrides) setOrDeleteKey(settings, 'skillOverrides', i.target, isOn ? undefined : 'off')
-    })
-  }
-  const modItems = items.filter(i => i.control !== 'skillOverrides')
-  if (modItems.length > 0) {
-    const off = await readModOffList($, root)
-    for (const i of modItems) {
-      if (i.control === 'pluginSkill') off.pluginSkills = toggleInList(off.pluginSkills, i.target, isOn)
-      else off.hooks = toggleInList(off.hooks, i.target, isOn)
+  // 줄마다 settingsRoot 디렉토리의 설정을 바꿈. 하위 디렉토리 줄을 누르면 그 디렉토리에서 여는 세션에 적용됨
+  for (const settingsRoot of new Set(items.map(i => i.settingsRoot))) {
+    const itemsInRoot = items.filter(i => i.settingsRoot === settingsRoot)
+    const overrides = itemsInRoot.filter(i => i.control === 'skillOverrides')
+    if (overrides.length > 0) {
+      await editSettingsFile($, localSettingsPath(settingsRoot), settings => {
+        for (const i of overrides) setOrDeleteKey(settings, 'skillOverrides', i.target, isOn ? undefined : 'off')
+      })
     }
-    await writeModOffList($, root, off)
+    // 묶인 훅 줄은 묶인 훅 하나하나를 같이 끄고 켬
+    const modItems = itemsInRoot.filter(i => i.control !== 'skillOverrides').flatMap(i => i.members ?? [i])
+    if (modItems.length > 0) {
+      const off = await readModOffList($, settingsRoot)
+      for (const i of modItems) {
+        if (i.control === 'pluginSkill') off.pluginSkills = toggleInList(off.pluginSkills, i.target, isOn)
+        else off.hooks = toggleInList(off.hooks, i.target, isOn)
+      }
+      await writeModOffList($, settingsRoot, off)
+    }
   }
-  await refreshHarnessPanel($)
+  await refreshHarnessPanel($, 'keep-missing')
 }
 
 async function setPluginOn($: Engine, group: HarnessGroup, isOn: boolean) {
@@ -612,7 +871,7 @@ async function setPluginOn($: Engine, group: HarnessGroup, isOn: boolean) {
     setOrDeleteKey(settings, 'enabledPlugins', group.pluginId!, isOn ? true : false)
   })
   $.ui.toast(text.toast.pluginToggled(group.title, isOn))
-  await refreshHarnessPanel($)
+  await refreshHarnessPanel($, 'keep-missing')
 }
 
 async function setGroupOn($: Engine, group: HarnessGroup, isOn: boolean) {
@@ -647,7 +906,7 @@ async function moveItemToTrash($: Engine, item: HarnessItem) {
   try {
     const trashed = await moveHarnessToTrash($, item, home)
     await writeTrashList($, root, [trashed, ...(await readTrashList($, root)).filter(t => t.id !== trashed.id)])
-    if (item.kind === 'skill') await forgetSeenSkill($, root, item.target)
+    if (item.kind === 'skill' && item.settingsRoot === root) await forgetSeenSkill($, root, item.target)
     await showChangeImmediately($, groups => groups.map(g => ({ ...g, items: g.items.filter(i => i.id !== item.id) })))
     $.ui.toast(text.toast.movedToTrash(item.label))
   } catch (error) {
@@ -655,7 +914,7 @@ async function moveItemToTrash($: Engine, item: HarnessItem) {
   }
   await update($, selectedItemAtom, () => null)
   await update($, confirmingTrashAtom, () => null)
-  await refreshHarnessPanel($)
+  await refreshHarnessPanel($, 'keep-missing')
 }
 
 async function restoreTrashedItem($: Engine, trashed: TrashedHarness) {
@@ -667,7 +926,7 @@ async function restoreTrashedItem($: Engine, trashed: TrashedHarness) {
   } catch (error) {
     $.ui.toast(text.toast.restoreFailed((error as Error).message))
   }
-  await refreshHarnessPanel($)
+  await refreshHarnessPanel($, 'keep-missing')
 }
 
 // ── 꺼 둔 것 막기 ──────────────────────────────────
@@ -785,33 +1044,48 @@ function resolveGroupSwitchState(group: HarnessGroup): SwitchState {
   return on === group.items.length ? 'on' : on === 0 ? 'off' : 'mixed'
 }
 
+// 위쪽 탭 이름은 언어 설정과 상관없이 영어. 다른 패널 탭 이름과 맞춤. 패널 안 제목은 언어 설정을 따름
+const PANE_TAB_TITLE = MESSAGES.en.panelTitle
+
+// 세션 시작 때 패널을 자동으로 열지 저장함. 세션이 바뀌어도 유지됨
+// value: false = 꺼짐 / 값 없음 또는 true = 켜짐 (이 버튼이 생기기 전부터 항상 열렸으므로 기본은 켜짐)
+const AUTO_OPEN_KEY = 'autoOpen'
+
+const isPaneAutoOpenOn = async ($: EngineInterface) => (await $.store.get(AUTO_OPEN_KEY)) !== false
+
+// 자동 열기가 켜짐이면 패널을 엶. 이미 열린 패널은 꺼짐이어도 다시 열어 제목을 지금 것으로 바꿔 줌
+const openPaneAtSessionStart = async ($: EngineInterface) => {
+  const isPaneOpen = (await $.ui.panes()).some(pane => pane.id === PANE)
+  if (isPaneOpen || (await isPaneAutoOpenOn($))) void $.ui.open({ id: PANE, title: PANE_TAB_TITLE, columns: PANE_COLUMNS })
+}
+
 export const register: Register = (on, options) => {
   text = resolveMessages(options.language)
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'harness', description: text.command.description })
-    await refreshHarnessPanel($)
-    void $.ui.open({ id: PANE, title: text.panelTitle, columns: PANE_COLUMNS })
+    await rediscoverDirectoriesAndRefreshPanel($)
+    await openPaneAtSessionStart($)
     return next(e)
   })
 
-  // /resume·/clear 로 대화가 바뀌면 패널 상태도 새 대화용으로 비워짐. 그때 바로 다시 채우고 패널을 엶
+  // /resume·/clear 로 대화가 바뀌면 패널 상태도 새 대화용으로 비워짐. 그때 바로 다시 채우고, 자동 열기가 켜짐이면 패널을 엶
   on('classic.SessionStart', async ($, e, next) => {
     const result = await next(e)
-    await refreshHarnessPanel($)
-    void $.ui.open({ id: PANE, title: text.panelTitle, columns: PANE_COLUMNS })
+    await rediscoverDirectoriesAndRefreshPanel($)
+    await openPaneAtSessionStart($)
     return result
   })
 
   on('command.run', { command: 'harness' }, async $ => {
-    await refreshHarnessPanel($)
-    await $.ui.open({ id: PANE, title: text.panelTitle, columns: PANE_COLUMNS })
+    await rediscoverDirectoriesAndRefreshPanel($)
+    await $.ui.open({ id: PANE, title: PANE_TAB_TITLE, columns: PANE_COLUMNS })
     return { text: text.command.opened }
   })
 
   // /skills 나 settings 파일을 직접 고친 것도 따라가도록 턴이 끝날 때마다 다시 읽음
   on('turn.complete', async ($, e, next) => {
-    await refreshHarnessPanel($)
+    await refreshHarnessPanel($, 'forget-missing')
     return next(e)
   })
 
@@ -855,6 +1129,12 @@ export const register: Register = (on, options) => {
     const width = e.props.bodyColumns
     const all = groups.flatMap(g => g.items)
     const onCount = all.filter(i => i.isOn).length
+    const isAutoOpenOn = await isPaneAutoOpenOn($)
+
+    const toggleAutoOpen = async () => {
+      await $.store.set(AUTO_OPEN_KEY, !isAutoOpenOn)
+      $.ui.invalidate('ui.render')
+    }
 
     const jumpToGroup = (groupId: string) => $.ui.scroll({ to: { key: `g-${groupId}` }, in: PANE, block: 'start' })
     const toggleGroupOpen = (groupId: string) =>
@@ -910,10 +1190,11 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
-        {/* 헤더: 패널 이름 + 닫기 */}
-        <Box>
+        {/* 헤더: 패널 이름 + 자동 열기 + 닫기 */}
+        <Box columnGap={1}>
           <Text bold>{text.panelTitle}</Text>
           <Box flexGrow={1} />
+          <Button key="auto-open" label={text.autoOpen(isAutoOpenOn)} onPress={toggleAutoOpen} />
           <Button key="close-pane" role="dismiss" label={text.close} onPress={() => $.ui.close({ id: PANE })} />
         </Box>
         {/* 섹션 이동 탭 */}
@@ -925,13 +1206,21 @@ export const register: Register = (on, options) => {
         <Text dimColor>{'─'.repeat(Math.max(1, width))}</Text>
         {/* 목록 시작 전 요약: 전체 켜진 개수 */}
         <Text dimColor>{text.summary(all.length, onCount)}</Text>
-        {groups.map(g => {
+        {groups.map((g, groupIndex) => {
+          const isFirstInZone = groupIndex === 0 || groups[groupIndex - 1]!.zone !== g.zone
           const isOpen = !!openGroups[g.id]
           const groupOn = g.items.filter(i => i.isOn).length
           const isDimmed = g.pluginId !== undefined && !g.isPluginOn
           const groupSwitch = resolveGroupSwitchState(g)
           return (
             <Box key={`g-${g.id}`} flexDirection="column" marginTop={1}>
+              {isFirstInZone && (
+                <Box key={`zone-${g.zone}`} flexDirection="column" marginBottom={1}>
+                  <Text dimColor>{text.zones[g.zone]}</Text>
+                  <Text dimColor>{'─'.repeat(Math.max(1, width))}</Text>
+                </Box>
+              )}
+              <Box flexDirection="column" paddingLeft={g.isNestedDirectory ? 2 : 0}>
               <Box>
                 <Button
                   key={`fold-${g.id}`}
@@ -939,16 +1228,18 @@ export const register: Register = (on, options) => {
                   label={`${g.items.length === 0 ? ' ' : isOpen ? '▾' : '▸'} ${cutToWidth(g.title, width - 30)}`}
                   onPress={() => toggleGroupOpen(g.id)}
                 />
-                <Text dimColor> {g.where}</Text>
+                <Text dimColor> {cutToWidth(g.where, 18)}</Text>
                 <Box flexGrow={1} />
                 {g.items.length > 0 && <Text dimColor>{groupOn}/{g.items.length} </Text>}
-                <Button
-                  key={`all-${g.id}`}
-                  variant={groupSwitch === 'off' ? undefined : 'primary'}
-                  dimColor={groupSwitch === 'off'}
-                  label={text.switch[groupSwitch]}
-                  onPress={() => setGroupOn($, g, groupSwitch !== 'on')}
-                />
+                {(g.items.length > 0 || g.pluginId !== undefined) && (
+                  <Button
+                    key={`all-${g.id}`}
+                    variant={groupSwitch === 'off' ? undefined : 'primary'}
+                    dimColor={groupSwitch === 'off'}
+                    label={text.switch[groupSwitch]}
+                    onPress={() => setGroupOn($, g, groupSwitch !== 'on')}
+                  />
+                )}
               </Box>
               {isOpen &&
                 g.items.map(item => (
@@ -974,6 +1265,7 @@ export const register: Register = (on, options) => {
                     {selectedItem === item.id && renderItemActions(item)}
                   </Box>
                 ))}
+              </Box>
             </Box>
           )
         })}

@@ -95,3 +95,90 @@ test('같은 묶음의 훅을 하나만 끄면 그 줄만 OFF 로 바뀜', async
   expect((await ui.find({ key: 'switch-hook:project:PreToolUse|Bash:bash a.sh' }))?.text).toContain('OFF')
   expect((await ui.find({ key: 'switch-hook:project:PreToolUse|Bash:bash b.sh' }))?.text).toContain('ON')
 })
+
+// iTerm2 Claude Code 연동처럼 확장자 없는 실행 파일 하나를 여러 이벤트에 건 settings
+const CC_STATUS = '/Users/example/.config/iterm2/cc-status'
+const CC_STATUS_ID = `hook:project:${CC_STATUS}`
+const CC_STATUS_ON_THREE_EVENTS = {
+  hooks: {
+    UserPromptSubmit: [{ hooks: [{ type: 'command', command: CC_STATUS }] }],
+    PreToolUse: [{ hooks: [{ type: 'command', command: CC_STATUS }] }],
+    Stop: [{ hooks: [{ type: 'command', command: CC_STATUS }] }],
+  },
+}
+
+test('같은 명령을 여러 이벤트에 건 훅은 실행 파일 이름으로 한 줄만 보임', async ($, on) => {
+  setUpEngine(on, 'mac', { settings: CC_STATUS_ON_THREE_EVENTS })
+  const ui = await mountHarnessPane($)
+
+  expect((await ui.find({ key: `name-${CC_STATUS_ID}` }))?.text).toContain('cc-status')
+  expect(await ui.find({ key: `name-hook:project:UserPromptSubmit|:${CC_STATUS}` })).toBeUndefined()
+
+  await ui.press({ key: `name-${CC_STATUS_ID}` })
+  const actions = (await ui.find({ key: `actions-${CC_STATUS_ID}` }))?.text ?? ''
+  expect(actions).toContain('When a prompt is sent')
+  expect(actions).toContain('Before a tool runs')
+})
+
+test('묶인 훅 줄을 끄면 모든 이벤트에서 안 돎', async ($, on) => {
+  const { commands } = setUpEngine(on, 'mac', { settings: CC_STATUS_ON_THREE_EVENTS })
+  // 패널이 막지 않으면 Claude Code 가 settings 훅을 직접 돌림. 그 횟수를 셈
+  const engine = { runs: 0 }
+  on('classic.PreToolUse', () => {
+    engine.runs += 1
+    return {}
+  })
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: '', stderr: '', interrupted: false } }))
+  const ui = await mountHarnessPane($)
+
+  await ui.press({ key: `switch-${CC_STATUS_ID}` })
+  expect((await ui.find({ key: `switch-${CC_STATUS_ID}` }))?.text).toContain('OFF')
+
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  expect(commands.some(c => c[0] === 'sh' && c[2] === CC_STATUS)).toBe(false)
+  expect(engine.runs).toBe(0)
+
+  await ui.press({ key: `switch-${CC_STATUS_ID}` })
+  expect((await ui.find({ key: `switch-${CC_STATUS_ID}` }))?.text).toContain('ON')
+})
+
+test('묶인 훅 줄을 휴지통으로 옮기면 모든 이벤트에서 빠지고, 되돌리면 모두 다시 들어감', async ($, on) => {
+  const { files, settings } = setUpEngine(on, 'mac', { settings: CC_STATUS_ON_THREE_EVENTS })
+  const ui = await mountHarnessPane($)
+
+  await ui.press({ key: `name-${CC_STATUS_ID}` })
+  await ui.press({ key: `trash-${CC_STATUS_ID}` })
+  await ui.press({ key: `trash-yes-${CC_STATUS_ID}` })
+  expect(JSON.parse(files.get(settings)!).hooks).toBeUndefined()
+
+  await ui.press({ key: 'fold-trash' })
+  await ui.press({ key: `restore-${CC_STATUS_ID}` })
+  const restored = JSON.parse(files.get(settings)!).hooks
+  expect(Object.keys(restored).sort()).toEqual(['PreToolUse', 'Stop', 'UserPromptSubmit'])
+  expect(restored.Stop[0].hooks[0].command).toBe(CC_STATUS)
+})
+
+test('같은 종류 안에서는 이름순으로 보임', async ($, on) => {
+  setUpEngine(on, 'mac', {
+    settings: {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: 'Edit|Write',
+            hooks: [
+              { type: 'command', command: 'bash .claude/hooks/test-plan-gate.sh' },
+              { type: 'command', command: 'bash .claude/hooks/code-layer-gate.sh' },
+              { type: 'command', command: 'bash .claude/hooks/github-pr-body-check.sh' },
+            ],
+          },
+        ],
+      },
+    },
+  })
+  const ui = await mountHarnessPane($)
+
+  const section = (await ui.find({ key: 'g-proj' }))?.text ?? ''
+  const order = ['code-layer-gate.sh', 'github-pr-body-check.sh', 'test-plan-gate.sh'].map(name => section.indexOf(name))
+  expect(order.every(i => i >= 0)).toBe(true)
+  expect(order).toEqual([...order].sort((a, b) => a - b))
+})

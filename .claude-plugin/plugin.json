@@ -1,6 +1,6 @@
 {
   "name": "harness-panel",
-  "version": "0.1.0",
+  "version": "0.1.6",
   "description": "Turn skills, hooks and plugins on or off per directory from a side panel",
   "types": "./types/index.d.ts",
   "userConfig": {
